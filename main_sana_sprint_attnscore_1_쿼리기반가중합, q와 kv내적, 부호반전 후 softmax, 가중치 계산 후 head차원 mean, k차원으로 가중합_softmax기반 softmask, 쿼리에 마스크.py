@@ -1,8 +1,3 @@
-# 간소화된 버전: mask_dropout + shared attention + guidance_schedule
-# (residual, concept_bias, ca_score_scale, token_weight_scale 제거)
-# + Frame별 Attention Map 시각화 기능 추가
-# 내 key에는 mask X
-# dreamsim 0.28대
 
 import os
 import re
@@ -22,7 +17,6 @@ from diffusers.models.attention import Attention
 from pathlib import Path
 import inspect
 
-# === [추가됨] 시각화 라이브러리 ===
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -36,7 +30,6 @@ PRINT_EVERY = 1
 TOPK_FALLBACK_RATIO = 0.5
 OTSU_SCALER = 1.0
 
-# ★★★ Attention Map 시각화 옵션 ★★★
 SAVE_ATTN_MAPS = False  # True로 변경하면 frame별 attention map 저장
 ATTN_MAP_SAVE_DIR = "./attn_maps_debug"  # 저장 디렉토리
 
@@ -252,7 +245,7 @@ class CrossSelfKVMasker:
                 # 확실하게 device 맞춰주기 (이미 tensor라 보통 맞지만 안전하게)
                 m = m.to(device)
 
-            # ★★★ mask_dropout 적용 ★★★
+            # mask_dropout 
             if self.mask_dropout > 0.0:
                 drop = (torch.rand_like(m.float()) < self.mask_dropout)
                 m[drop] = 0.0
@@ -286,7 +279,6 @@ class SanaLinearAttnProcessor2_0_SharedKVAll:
         self.eps = float(eps)
         self.masker = masker
         self._printed_shapes = False
-        # ★★★ Attention map 저장 설정 ★★★
         self._save_attn_maps = save_attn_maps
         self._attn_save_dir = Path(attn_save_dir)
         self.use_adaptive_residual = use_adaptive_residual
@@ -424,7 +416,6 @@ class SanaLinearAttnProcessor2_0_SharedKVAll:
 
         weights = torch.softmax(scores, dim=-1)
 
-        # ★★★ 수집 ★★★
         if self.masker is not None:
             self.masker.collect(weights)
 
@@ -497,40 +488,26 @@ class SanaLinearAttnProcessor2_0_SharedKVAll:
         phi_k_full = F.relu(k).float()
         v_full = v.float()
 
-        # --- Mask 생성 ---
+
         k_mask_src = self.masker.get_mask_for_seq_len(Tq, device=phi_k_full.device) if self.masker is not None else None
         if k_mask_src is None:
             k_mask_src = torch.ones((B, Tq), dtype=torch.bool, device=phi_k_full.device)
 
         k_mask = k_mask_src.unsqueeze(1).unsqueeze(-1).to(phi_q.dtype)
-
-        # 2. Query Masking
         phi_q_masked = phi_q * k_mask
 
-        # --- Linear Attention Matrices (S, z) ---
-        # A. Unmasked Full
         phi_k_full_T = phi_k_full.transpose(-1, -2)
         S_frame_full = torch.matmul(phi_k_full_T, v_full)  # (B, H, D, D)
         z_frame_full = phi_k_full_T.sum(dim=-1, keepdim=True)  # (B, H, D, 1)
 
-        # ========================================================================
-        # [수정됨] Masked Query 기반 Column-wise Cosine Similarity
-        # ========================================================================
-        S_frame_T = S_frame_full.transpose(-1, -2)  # (C, H, V, K)
-        # 1. 분자: 내적(Dot Product) 계산
 
+        S_frame_T = S_frame_full.transpose(-1, -2)  # (C, H, V, K)
         proxy_output_sum = torch.einsum('b h n k, c h v k -> b c h k', phi_q_masked, S_frame_T)
         raw_dot_product = proxy_output_sum / Tq
 
-        # 2. 헤드 차원 평균 (Head Aggregation)
-        # (B, C, H, V) -> (B, C, 1, V)
-        # 기존 로직과 동일하게 헤드 간의 합의된 점수를 사용합니다.
-        # 만약 헤드별로 다르게 가중치를 주고 싶다면 이 줄을 지우시면 됩니다.
         scores = raw_dot_product.mean(dim=2, keepdim=True)
         ttt = 20.0
         channel_weights_probs = F.softmax((-scores) / ttt, dim=-1)
-
-        # (선택) 만약 "나랑 다른 것(유사도 낮은 것)"에 가중치를 더 주고 싶다면 뒤집기
 
         """
         # === 시각화 코드 (Standard Scaler + Sigmoid 전용) ===
@@ -600,16 +577,13 @@ class SanaLinearAttnProcessor2_0_SharedKVAll:
         H_dim = raw_dot_product.shape[2]
         channel_weights = channel_weights_probs.expand(-1, -1, H_dim, -1)
 
-        # 5. KV Matrix Aggregation (가중 합)
         S_base = torch.einsum('b c h k, c h k v -> b h k v', channel_weights, S_frame_full)
         z_base = torch.einsum('b c h k, c h k i -> b h k i', channel_weights, z_frame_full)
 
-        # Self Correction
         indices = torch.arange(B, device=phi_q.device)
         self_channel_weights = channel_weights[indices, indices, :, :]  # (B, H, D)
         self_channel_weights = self_channel_weights.unsqueeze(-1)  # (B, H, K, 1)
 
-        # Final Linear Attention
         num = torch.matmul(phi_q_masked, S_base)
         den = torch.matmul(phi_q_masked, z_base)
         attn_out = num / (den + self.eps)
@@ -834,14 +808,14 @@ def main(args):
     # 6) VAE tiling
     pipeline.vae.enable_tiling()
 
-    # ★★★ Guidance Schedule 파싱 ★★★
+
     cfg_sched = _parse_guidance_schedule(args.guidance_schedule, args.num_inference_steps, args.guidance_scale)
     g0 = float(cfg_sched[0])
     print(f"[CFG] schedule={cfg_sched}, base(g0)={g0}")
 
     # 7) 콜백: 다음 스텝용 prompt_embeds를 alpha = g_next / g0 로 스케일링
     def on_step_end(pipeline, i, t, callback_kwargs):
-        # ★★★ Guidance schedule 적용 ★★★
+
         nxt = i + 1
         if nxt < len(cfg_sched):
             g_next = float(cfg_sched[nxt])
@@ -919,7 +893,6 @@ def main(args):
 
                 start_time = time.time()
 
-                # ★★★ guidance_scale은 베이스(첫 스텝) 값 ★★★
                 result = pipeline(
                     prompts,
                     generator=generator,
@@ -969,7 +942,6 @@ if __name__ == '__main__':
     parser.add_argument('--mask_dropout', type=float, default=0.0,
                         help='Mask dropout rate: fraction of subject positions to randomly deactivate')
 
-    # ★★★ Attention map 시각화 옵션 ★★★
     parser.add_argument('--save_attn_maps', action='store_true',
                         help='Save frame-wise shared attention maps to file')
     parser.add_argument('--attn_save_dir', type=str, default='./attn_maps_debug_1222',
