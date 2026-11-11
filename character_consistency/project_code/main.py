@@ -1,33 +1,678 @@
+
 import os
+import re
+import time
 import yaml
 import torch
 import argparse
-import time
 from tqdm import tqdm
+from typing import Optional
 from diffusers import SanaSprintPipeline
+import numpy as np
+import math
+from skimage import filters
+from collections import defaultdict
+import torch.nn.functional as F
+from diffusers.models.attention import Attention
 from pathlib import Path
-from modules.mask import CrossSelfKVMasker
-from modules.utils import create_token_indices_span, _parse_guidance_schedule, _scale_prompt_embeds_for_alpha, sanitize_filename, single_benchmark
-from modules.myAttention import install_shared_linear_attn_processors, enable_precollect_cross_before_self
+import inspect
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+
+# =============== DEBUG SWITCHES ===============
+
+DEBUG = True
+PRINT_EVERY = 1
+TOPK_FALLBACK_RATIO = 0.5
+OTSU_SCALER = 1.0
+
+#  Attention Map 시각화 옵션 
+SAVE_ATTN_MAPS = False  # True로 변경하면 frame별 attention map 저장
+ATTN_MAP_SAVE_DIR = "./attn_maps_debug"  # 저장 디렉토리
+
+def _dbg_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+# =============== 유틸 ===============
+
+def attn_map_to_binary(attention_map, scaler=1.0):
+    attention_map_np = attention_map.detach().float().cpu().numpy()
+    try:
+        threshold_value = filters.threshold_otsu(attention_map_np) * scaler
+    except Exception:
+        threshold_value = float(np.median(attention_map_np)) * scaler
+    binary_mask = (attention_map_np >= threshold_value).astype(np.uint8)
+    return binary_mask
+
+def _find_subseq(haystack, needle):
+    if not needle or len(needle) > len(haystack):
+        return -1
+    first = needle[0]
+    for i, t in enumerate(haystack[:len(haystack)-len(needle)+1]):
+        if t == first and haystack[i:i+len(needle)] == needle:
+            return i
+    return -1
+
+def create_token_indices_span(prompts, batch_size, concept_token, tokenizer):
+    if isinstance(concept_token, str):
+        concept_token = [concept_token]
+    
+    concept_ids_list = []
+    for x in concept_token:
+        cand = []
+        ids1 = tokenizer.encode(x, add_special_tokens=False)
+        ids2 = tokenizer.encode(" " + x, add_special_tokens=False)
+        if len(ids2) > 0: cand.append(ids2)
+        if len(ids1) > 0: cand.append(ids1)
+        concept_ids_list.append(cand)
+    
+    batch = tokenizer.batch_encode_plus(prompts, padding=True, return_tensors='pt')
+    tokens = batch["input_ids"]
+    
+    token_indices = torch.full((len(concept_token), batch_size), -1, dtype=torch.int64)
+    span_lens = torch.zeros((len(concept_token), batch_size), dtype=torch.int64)
+    
+    for i, cand_seqs in enumerate(concept_ids_list):
+        for b in range(batch_size):
+            hs = tokens[b].tolist()
+            found = False
+            for needle in cand_seqs:
+                j = _find_subseq(hs, needle)
+                if j != -1:
+                    token_indices[i, b] = j
+                    span_lens[i, b] = len(needle)
+                    found = True
+                    break
+            if not found:
+                token_indices[i, b] = -1
+                span_lens[i, b] = 0
+    
+    if DEBUG:
+        print("[DBG] concept strings:", concept_token)
+        print("[DBG] token_indices (span start):", token_indices.tolist())
+        print("[DBG] span_lens:", span_lens.tolist())
+    
+    return token_indices, span_lens
+
+# =============== Guidance Schedule ===============
+
+def _parse_guidance_schedule(s: Optional[str], steps: int, fallback: float):
+    """
+    guidance_schedule 문자열을 파싱해서 리스트로 변환
+    예: "8,5" → [8.0, 5.0]
+    """
+    if s is None:
+        return [float(fallback)] * steps
+    
+    vals = [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+    if len(vals) == 1:
+        vals = vals * steps
+    if len(vals) != steps:
+        raise ValueError(f"--guidance_schedule length ({len(vals)}) must equal num_inference_steps ({steps})")
+    return vals
+
+def _scale_prompt_embeds_for_alpha(prompt_embeds: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    prompt_embeds: [2B, ...] (uncond, cond) 순서라고 가정
+    cond' = uncond + alpha * (cond - uncond)
+    alpha = g_next / g0
+    """
+    if prompt_embeds is None:
+        return None
+    
+    B2 = prompt_embeds.shape[0]
+    if B2 % 2 != 0:
+        return prompt_embeds
+    
+    uncond, cond = prompt_embeds.chunk(2, dim=0)
+    cond_new = uncond + alpha * (cond - uncond)
+    
+    return torch.cat([uncond, cond_new], dim=0)
+
+# =============== 마스커 ===============
+
+class CrossSelfKVMasker:
+    """
+    cross-attn weights 수집 → concept 스팬으로 Q-스코어 생성 → Otsu bin → mask
+    """
+
+    def __init__(self, mask_dropout: float = 0.0, max_history: int = 20, temperature: float=0.0005):
+        self.mask_dropout = float(mask_dropout)
+        self.max_history = int(max_history)
+        self.step_store = []
+        self.token_indices = None
+        self.span_lens = None
+        self.last_masks = {}
+        self._collect_calls = 0
+        self.shape_hist = defaultdict(int)
+        self._prev_agg_collect_calls = 0
+        self.temperature = float(temperature)
+
+    def reset(self):
+        self.step_store.clear()
+        self.last_masks.clear()
+        self._collect_calls = 0
+        self.shape_hist.clear()
+        self._prev_agg_collect_calls = 0
+        if DEBUG:
+            print("[DBG] Masker.reset(): cleared histories")
+
+    def set_token_indices(self, token_indices: torch.Tensor, span_lens: Optional[torch.Tensor] = None):
+        self.token_indices = token_indices
+        self.span_lens = span_lens
+        if DEBUG:
+            print(
+                f"[DBG] Masker.set_token_indices(): idx shape {tuple(token_indices.shape) if token_indices is not None else None}")
+
+    @torch.no_grad()
+    def collect(self, weights_bhqk: torch.Tensor):
+        if weights_bhqk.dim() == 4:
+            attn_bqk = weights_bhqk.mean(dim=1)
+        elif weights_bhqk.dim() == 3:
+            attn_bqk = weights_bhqk
+        else:
+            return
+
+        self.step_store.append(attn_bqk.detach())
+        self._collect_calls += 1
+
+        if len(self.step_store) > self.max_history:
+            self.step_store = self.step_store[-self.max_history:]
+
+    @torch.no_grad()
+    def aggregate(self) -> bool:
+        if not self.step_store or self.token_indices is None:
+            if DEBUG:
+                print("[DBG] aggregate(): skipped (no step_store or no token_indices)")
+            return False
+        
+        attn_maps = torch.stack(self.step_store, dim=0).mean(dim=0)
+        B, Q, K = attn_maps.shape
+        device = attn_maps.device
+        
+        if DEBUG:
+            print(f"[DBG] aggregate(): attn_maps shape = (B={B}, Q={Q}, K={K})")
+        
+        masks = []
+        num_concepts = self.token_indices.shape[0]
+        
+        for b in range(B):
+            per_concept_bins = []
+            valid_concepts = 0
+            
+            for c in range(num_concepts):
+                idx = int(self.token_indices[c, b].item())
+                span = int(self.span_lens[c, b].item()) if (self.span_lens is not None) else 1
+                
+                if 0 <= idx < K:
+                    valid_concepts += 1
+                    end = min(idx + max(1, span), K)
+                    span_matrix = attn_maps[b, :, idx:end]
+                    vec = span_matrix.mean(dim=-1)
+                else:
+                    continue
+                
+                # Otsu threshold
+                vec_np = vec.detach().float().cpu().numpy()
+                try:
+                    threshold_val = filters.threshold_otsu(vec_np)
+                except Exception:
+                    threshold_val = np.median(vec_np)
+                
+                binv_np = (vec_np >= (threshold_val * OTSU_SCALER)).astype(np.uint8)
+                
+                # top-k fallback
+                if binv_np.sum() == 0:
+                    scores = vec.detach().float().cpu().numpy()
+                    k = max(1, int(TOPK_FALLBACK_RATIO * len(scores)))
+                    top_idx = np.argpartition(scores, -k)[-k:]
+                    binv_np[top_idx] = 1
+                    if DEBUG:
+                        print(f"[DBG] Otsu empty → top-{int(100*TOPK_FALLBACK_RATIO)}% fallback")
+                
+                binv = torch.from_numpy(binv_np).to(device).bool().view(-1)
+                per_concept_bins.append(binv)
+            
+            if valid_concepts > 0:
+                m = torch.stack(per_concept_bins, dim=0).max(dim=0).values
+            else:
+                vec_all = attn_maps[b].mean(dim=-1)
+                binv_np = attn_map_to_binary(vec_all, scaler=OTSU_SCALER)
+                if binv_np.sum() == 0:
+                    scores = vec_all.detach().float().cpu().numpy()
+                    k = max(1, int(TOPK_FALLBACK_RATIO * len(scores)))
+                    top_idx = np.argpartition(scores, -k)[-k:]
+                    binv_np[top_idx] = 1
+                m = torch.from_numpy(binv_np).to(device).bool().view(-1)
+            
+            # ★★★ mask_dropout 적용 ★★★
+            if self.mask_dropout > 0.0:
+                drop = (torch.rand_like(m.float()) < self.mask_dropout)
+                m[drop] = False
+                if DEBUG and b == 0:
+                    print(f"[DBG] mask_dropout={self.mask_dropout}: dropped {drop.sum().item()} positions")
+            
+            masks.append(m)
+        
+        mask_bn = torch.stack(masks, dim=0)
+        self.last_masks[Q] = mask_bn
+        
+        if DEBUG:
+            print(f"[DBG] aggregate(): mask per prompt (sum True) = {mask_bn.sum(dim=1).tolist()}")
+        
+        return True
+
+    def get_mask_for_seq_len(self, seq_len: int, device=None):
+        m = self.last_masks.get(seq_len, None)
+        if m is None:
+            return None
+        return m.to(device) if device is not None else m
+
+# =============== 프로세서 ===============
+
+class SanaLinearAttnProcessor2_0_SharedKVAll:
+    def __init__(self, my_name: str = "",eps: float = 1e-15, masker: Optional[CrossSelfKVMasker] = None,
+                 save_attn_maps: bool = False, attn_save_dir: str = "./attn_maps_debug",
+                 use_adaptive_residual: bool = False, **kwargs):
+        self.my_name = my_name
+        self.eps = float(eps)
+        self.masker = masker
+        self._printed_shapes = False
+        # ★★★ Attention map 저장 설정 ★★★
+        self._save_attn_maps = save_attn_maps
+        self._attn_save_dir = Path(attn_save_dir)
+        self.use_adaptive_residual = use_adaptive_residual
+        self.current_dump_path = None 
+        self.global_step_counter = 0 # 파일명 중복 방지용 카운터
+        self.curr_superclass = "default"
+        self.curr_index = 0
+        self.current_prompts = []
+        # 추가 파라미터 저장
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+    def _proj_out(self, attn: Attention, x: torch.Tensor, original_dtype: torch.dtype) -> torch.Tensor:
+        wdtype = attn.to_out[0].weight.dtype
+        if x.dtype != wdtype:
+            x = x.to(wdtype)
+        x = attn.to_out[0](x)
+        x = attn.to_out[1](x)
+        if x.dtype != original_dtype:
+            x = x.to(original_dtype)
+        if original_dtype == torch.float16:
+            x = x.clip(-65504, 65504)
+        return x
+
+    def _save_feature_map(self, tensor_data, name_prefix, current_step, batch_idx, cmap='viridis', normalize=True, vmin=None, vmax=None):
+        """
+        시각화 저장 헬퍼 함수 (수정됨: vmin, vmax 인자 추가)
+        """
+        try:
+            # 1. 보간법 (32x32 -> 1024x1024)
+            h, w = tensor_data.shape
+            vec_t = torch.from_numpy(tensor_data).view(1, 1, h, w).float()
+
+            vec_big = F.interpolate(vec_t, size=(1024, 1024), mode='nearest').squeeze().numpy()
+
+            # 2. 폴더 구조 생성
+            group_folder_name = f"{self.curr_superclass}_{self.curr_index}"
+            
+            if batch_idx < len(self.current_prompts):
+                raw_prompt = self.current_prompts[batch_idx]
+                safe_prompt = sanitize_filename(raw_prompt)
+                if len(safe_prompt) > 50: safe_prompt = safe_prompt[:50]
+            else:
+                safe_prompt = f"batch_{batch_idx}"
+
+            target_dir = self._attn_save_dir / group_folder_name / safe_prompt
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            # 3. 파일명 생성
+            timestamp = int(time.time() * 1000000) % 1000000
+            layer_name = self.my_name.replace(".", "_") if self.my_name else "layer"
+            fname = target_dir / f"step_{current_step:03d}_{layer_name}_{name_prefix}_{timestamp}.png"
+
+            # 4. 저장 (로직 수정)
+            if normalize:
+                # 기존 로직 (PhiK 용)
+                v_min_c, v_max_c = vec_big.min(), vec_big.max()
+                vec_big = (vec_big - v_min_c) / (v_max_c - v_min_c + 1e-8)
+                plt.imsave(fname, vec_big, cmap=cmap, vmin=0.0, vmax=1.0)
+            else:
+                # 수정된 로직 (S_Mat 및 BinaryMask 용)
+                # vmin/vmax가 명시되면 그것을 따르고, 아니면 기존 S_Mat 로직(절댓값 최대 대칭)을 따름
+                if vmin is not None and vmax is not None:
+                    final_vmin, final_vmax = vmin, vmax
+                else:
+                    max_val = np.abs(vec_big).max() + 1e-6
+                    final_vmin, final_vmax = -max_val, max_val
+                    
+                plt.imsave(fname, vec_big, cmap=cmap, vmin=final_vmin, vmax=final_vmax)
+                
+        except Exception as e:
+            print(f"[Vis Error] {e}")
+
+    def _add_mask_safe(self, scores: torch.Tensor, attention_mask: Optional[torch.Tensor],
+                       attn: Attention, Q: int, K: int) -> torch.Tensor:
+        if attention_mask is None:
+            return scores
+        
+        mask = attention_mask
+        if mask.dtype != scores.dtype:
+            mask = mask.to(scores.dtype)
+        
+        while mask.dim() < 4:
+            mask = mask.unsqueeze(1)
+        
+        B, H = scores.shape[0], scores.shape[1]
+        if mask.shape[0] == B * H:
+            mask = mask.view(B, H, *mask.shape[1:])
+        
+        if mask.shape[1] not in (1, H):
+            mask = mask.mean(dim=1, keepdim=True)
+        
+        if mask.shape[-2] not in (1, Q):
+            mask = mask.mean(dim=-2, keepdim=True)
+        
+        if mask.shape[-1] != K:
+            if mask.shape[-1] > K:
+                mask = mask[..., :K]
+            else:
+                pad = K - mask.shape[-1]
+                mask = F.pad(mask, (0, pad))
+        
+        return scores + mask
+
+
+    def _cross_attention_vanilla(self, attn: Attention, hidden_states: torch.Tensor,
+                                encoder_hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor],
+                                original_dtype: torch.dtype) -> torch.Tensor:
+        B, Q, _ = hidden_states.shape
+        _, K, _ = encoder_hidden_states.shape
+        H = attn.heads
+        
+        Qp = attn.to_q(hidden_states)
+        Kp = attn.to_k(encoder_hidden_states)
+        Vp = attn.to_v(encoder_hidden_states)
+        
+        if attn.norm_q is not None:
+            Qp = attn.norm_q(Qp)
+        if attn.norm_k is not None:
+            Kp = attn.norm_k(Kp)
+        
+        Dh = Qp.shape[-1] // H
+        Dv = Vp.shape[-1] // H
+        
+        q = Qp.view(B, Q, H, Dh).permute(0, 2, 1, 3).contiguous()
+        k = Kp.view(B, K, H, Dh).permute(0, 2, 1, 3).contiguous()
+        v = Vp.view(B, K, H, Dv).permute(0, 2, 1, 3).contiguous()
+        
+        scale = getattr(attn, "scale", None) or (1.0 / math.sqrt(Dh))
+        q = q * scale
+        
+        scores = torch.matmul(q, k.transpose(-1, -2))
+        scores = self._add_mask_safe(scores, attention_mask, attn, Q, K)
+        
+        weights = torch.softmax(scores, dim=-1)
+        
+        #  수집 
+        if self.masker is not None:
+            self.masker.collect(weights)
+        
+        out = torch.matmul(weights, v)
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, Q, H * Dv)
+        out = self._proj_out(attn, out, original_dtype)
+        
+        if original_dtype == torch.float16:
+            out = out.clip(-65504, 65504)
+        return out
+
+    def _self_attention_linear_sharedkv(self, attn: Attention, hidden_states: torch.Tensor,
+                                    attention_mask: Optional[torch.Tensor],
+                                    original_dtype: torch.dtype) -> torch.Tensor:
+        B, Tq, _ = hidden_states.shape
+        H = attn.heads
+
+        Q = attn.to_q(hidden_states)
+        K = attn.to_k(hidden_states)
+        V = attn.to_v(hidden_states)
+
+        if attn.norm_q is not None:
+            Q = attn.norm_q(Q)
+        if attn.norm_k is not None:
+            K = attn.norm_k(K)
+
+        q = Q.view(B, Tq, H, -1).permute(0, 2, 1, 3).contiguous()
+        k = K.view(B, Tq, H, -1).permute(0, 2, 1, 3).contiguous()
+        v = V.view(B, Tq, H, -1).permute(0, 2, 1, 3).contiguous()
+
+        phi_q = F.relu(q).float()
+        phi_k = F.relu(k).float()
+        v_full = v.float()
+
+        phi_k_T = phi_k.transpose(-1, -2)
+        S_frame = torch.matmul(phi_k_T, v_full)
+        z_frame = phi_k_T.sum(dim=-1, keepdim=True)
+
+        k_mask_src = self.masker.get_mask_for_seq_len(Tq, device=phi_k.device) if self.masker is not None else None
+        if k_mask_src is None:
+            k_mask_src = torch.ones((B, Tq), device=phi_k.device, dtype=phi_k.dtype)
+        print(f"k_mask_src: {k_mask_src[0].sum()}")  # 디버깅용 출력
+
+
+        obj_hard_exp = k_mask_src.unsqueeze(1).unsqueeze(-1).to(phi_q.dtype)
+        bg_hard_exp  = (~k_mask_src).unsqueeze(1).unsqueeze(-1).to(phi_q.dtype)
+
+        # ── 객체(Object): Shared S (soft 대표 벡터 기반) ──
+        S_shared = S_frame.sum(dim=0, keepdim=True)
+        z_shared = z_frame.sum(dim=0, keepdim=True)
+
+        phi_q_obj = phi_q * obj_hard_exp
+        num_obj   = torch.matmul(phi_q_obj, S_shared)
+        den_obj   = torch.matmul(phi_q_obj, z_shared)
+        attn_out_obj = num_obj / (den_obj + self.eps)
+
+        # ── 배경(Background): Self S (함수 상단에서 구한 S_frame 재활용) ──
+        phi_q_bg = phi_q * bg_hard_exp
+        num_bg   = torch.matmul(phi_q_bg, S_frame)
+        den_bg   = torch.matmul(phi_q_bg, z_frame)
+        attn_out_bg = num_bg / (den_bg + self.eps)
+
+        # ── 베이스 합성 (기존 attn_out_shared 역할) ──
+        attn_out_shared = attn_out_obj * obj_hard_exp + attn_out_bg * bg_hard_exp
+        attn_out_shared_flat = attn_out_shared.permute(0, 2, 1, 3).contiguous().view(B, Tq, -1)
+        out = self._proj_out(attn, attn_out_shared_flat, original_dtype)
+
+        if original_dtype == torch.float16:
+            out = out.clip(-65504, 65504)
+        return out
+
+
+    def __call__(self, attn: Attention, hidden_states: torch.Tensor,
+                encoder_hidden_states: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                **kwargs) -> torch.Tensor:
+        original_dtype = hidden_states.dtype
+        
+        is_cross = getattr(attn, "is_cross_attention", None)
+        if is_cross is None:
+            is_cross = (encoder_hidden_states is not None) and (encoder_hidden_states is not hidden_states)
+        
+        if is_cross:
+            if encoder_hidden_states is None:
+                encoder_hidden_states = hidden_states
+            return self._cross_attention_vanilla(
+                attn, hidden_states, encoder_hidden_states, attention_mask, original_dtype
+            )
+        else:
+            return self._self_attention_linear_sharedkv(
+                attn, hidden_states, attention_mask, original_dtype
+            )
+
+# =============== 프로세서 설치 ===============
+
+def install_shared_linear_attn_processors(
+    pipeline,
+    replace_self: bool = True,
+    replace_cross: bool = True,
+    only_block_indices_self=None,
+    only_block_indices_cross=None,
+    debug: bool = False,
+    masker: Optional[CrossSelfKVMasker] = None,
+    save_attn_maps: bool = False,
+    attn_save_dir: str = "./attn_maps_debug",
+    **processor_kwargs,
+) -> tuple[int, int]:
+    ap = getattr(pipeline.transformer, "attn_processors", None)
+    if ap is None:
+        raise AttributeError("pipeline.transformer.attn_processors가 없습니다.")
+    
+    pat = re.compile(r"transformer_blocks\.(\d+)\.(attn1|attn2)\.")
+    allow_self = None if only_block_indices_self is None else set(only_block_indices_self)
+    allow_cross = None if only_block_indices_cross is None else set(only_block_indices_cross)
+    
+    new_map = {}
+    rep_self = 0
+    rep_cross = 0
+    
+    for name, proc in ap.items():
+        m = pat.search(name)
+        if not m:
+            new_map[name] = proc
+            continue
+        
+        blk = int(m.group(1))
+        kind = m.group(2)
+        
+        if kind == "attn1" and (allow_self is not None) and (blk not in allow_self):
+            if debug: print(f"[keep] {name} (self: block {blk} not in allow_self)")
+            new_map[name] = proc
+            continue
+        
+        if kind == "attn2" and (allow_cross is not None) and (blk not in allow_cross):
+            if debug: print(f"[keep] {name} (cross: block {blk} not in allow_cross)")
+            new_map[name] = proc
+            continue
+        
+        do_replace = (kind == "attn1" and replace_self) or (kind == "attn2" and replace_cross)
+        if do_replace:
+            if debug:
+                print(f"[replace] {name} -> SanaLinearAttnProcessor2_0_SharedKVAll(masker=..., save_attn_maps={save_attn_maps})")
+            new_map[name] = SanaLinearAttnProcessor2_0_SharedKVAll(
+                my_name=name,
+                masker=masker,
+                save_attn_maps=save_attn_maps,
+                attn_save_dir=attn_save_dir,
+                **processor_kwargs
+            )
+            if kind == "attn1": rep_self += 1
+            else: rep_cross += 1
+        else:
+            if debug: print(f"[keep] {name} (keep default {kind})")
+            new_map[name] = proc
+    
+    pipeline.transformer.set_attn_processor(new_map)
+    
+    if debug:
+        scope_self = "ALL" if allow_self is None else f"{sorted(allow_self)}"
+        scope_cross = "ALL" if allow_cross is None else f"{sorted(allow_cross)}"
+        print(f"[INFO] replaced self(attn1): {rep_self} (scope_self={scope_self}), "
+              f"cross(attn2): {rep_cross} (scope_cross={scope_cross})")
+    
+    return rep_self, rep_cross
+
+def enable_precollect_cross_before_self(pipeline):
+    masker = getattr(pipeline, "_masker", None)
+    if masker is None:
+        return
+    
+    for i, blk in enumerate(getattr(pipeline.transformer, "transformer_blocks", [])):
+        attn2 = getattr(blk, "attn2", None)
+        norm2 = getattr(blk, "norm2", None)
+        
+        if attn2 is None or norm2 is None:
+            continue
+        
+        orig_forward = blk.forward
+        forward_signature = inspect.signature(orig_forward)
+        
+        # 클로저에 block index 'i'를 바인딩하기 위해 기본값 인자 사용
+        def wrapped_forward(*args, _i=i, _orig=orig_forward, _attn2=attn2, _norm2=norm2, _masker=masker, _sig=forward_signature, **kwargs):
+            # 1. 인자 바인딩
+            try:
+                bound_args = _sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+                
+                hidden_states = bound_args.arguments.get('hidden_states')
+                encoder_hidden_states = bound_args.arguments.get('encoder_hidden_states')
+                attention_mask = bound_args.arguments.get('attention_mask')
+                
+            except TypeError:
+                # 바인딩 실패 시 원본 실행 (안전장치)
+                return _orig(*args, **kwargs)
+
+            # 2. 마스크 생성 시도
+            if hidden_states is not None:
+                Q = int(hidden_states.shape[1])
+                
+                # (1) 텍스트(Encoder Hidden States)가 있는지 확인
+                if encoder_hidden_states is not None:
+                    # (2) 아직 마스크가 없는지 확인
+                    if _masker.get_mask_for_seq_len(Q, device=hidden_states.device) is None:
+                        # 실행!
+                        with torch.no_grad():
+                            h2 = _norm2(hidden_states)
+                            _ = _attn2(h2, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask)
+                        _masker.aggregate()
+                        _masker.step_store.clear()
+                else:
+                    # [디버깅] 텍스트가 안 들어온 경우 (이 로그가 뜨면 정상적으로 None인 것임)
+                    if DEBUG and _i == 0: # 0번 블록만 찍어봄
+                        print(f"[DBG] Block {_i}: encoder_hidden_states is NONE! (Unconditional pass or Architecture design)")
+
+            return _orig(*args, **kwargs)
+        
+        blk.forward = wrapped_forward
+
+def single_benchmark(dataset):
+    benchmark = {}
+    for key, values in dataset.items():
+        all_prompts = []
+        for index, v in enumerate(values):
+            style = v['style']
+            subject = v['subject']
+            settings = v['settings']
+            concept_token = v['concept_token']
+            id_prompt = f"{style} {subject}"
+            all_prompts.append((id_prompt, settings, index, subject))
+        benchmark[key] = all_prompts
+    return benchmark
+
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', "-", name)
 
 def main(args):
-    # 벤치마크 로드
+    # 1) Benchmark 로드
     with open(args.single_benchmark_dir, 'r') as f:
         dataset = yaml.safe_load(f)
     s_bench = single_benchmark(dataset)
     
-    # 파이프라인 로드
+    # 2) Pipeline 로드
     pipeline = SanaSprintPipeline.from_pretrained(
         args.pretrained_model,
         torch_dtype=torch.bfloat16,
     ).to(args.device)
     
-    # 마스커 초기화
+    # 3) Masker 초기화
     masker = CrossSelfKVMasker(mask_dropout=args.mask_dropout, max_history=20, temperature=args.temperature)
     pipeline._masker = masker
     
-    # 프로세서 설치
+    # 4) 프로세서 설치 (self: 선형 shared attention, cross: 기본)
     rep_self, rep_cross = install_shared_linear_attn_processors(
         pipeline,
         replace_self=True,
@@ -36,22 +681,29 @@ def main(args):
         only_block_indices_cross=None,
         debug=True,
         masker=masker,
+        save_attn_maps=args.save_attn_maps,
+        attn_save_dir=args.attn_save_dir,
         eps=1e-15,
     )
     
-    # self attention전에 cross attentino을 미리 실행해서 마스크 만드는 기능 사용
+    print(f"[INFO] Replaced self-attn: {rep_self}, cross-attn: {rep_cross}")
+    print(f"[INFO] mask_dropout: {args.mask_dropout}")
+    print(f"[INFO] save_attn_maps: {args.save_attn_maps}, save_dir: {args.attn_save_dir}")
+    
+    # 5) Pre-collect 활성화
     enable_precollect_cross_before_self(pipeline)
     
-    # 메모리 부족 방지
+    # 6) VAE tiling
     pipeline.vae.enable_tiling()
     
-    # 가이던스 스케줄 파싱
+    #  Guidance Schedule 파싱 
     cfg_sched = _parse_guidance_schedule(args.guidance_schedule, args.num_inference_steps, args.guidance_scale)
     g0 = float(cfg_sched[0])
     print(f"[CFG] schedule={cfg_sched}, base(g0)={g0}")
     
-    # (스텝마다 다른 가이던스 스케일 사용할때 유효)다음 스텝용 prompt_embeds를 alpha = g_next / g0 로 스케일링
+    # 7) 콜백: 다음 스텝용 prompt_embeds를 alpha = g_next / g0 로 스케일링
     def on_step_end(pipeline, i, t, callback_kwargs):
+        # Guidance schedule 적용 
         nxt = i + 1
         if nxt < len(cfg_sched):
             g_next = float(cfg_sched[nxt])
@@ -67,19 +719,22 @@ def main(args):
         else:
             tqdm.write(f"[CFG] step={i} done → last step; keep alpha")
         
+        # Masker aggregate
         m = getattr(pipeline, "_masker", None)
         if m is not None:
             ok = m.aggregate()
             m.step_store.clear()
+            if DEBUG:
+                tqdm.write(f"[DBG] on_step_end(step {i}): aggregate() -> {ok}")
 
         if hasattr(pipeline.transformer, "attn_processors"):
             for proc in pipeline.transformer.attn_processors.values():
                 if hasattr(proc, 'global_step_counter'):
                     proc.global_step_counter += 1
+        # ============================================================
         
         return callback_kwargs
     
-    # 이미지 생성 루프
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
     
     total_images = 0
@@ -92,10 +747,11 @@ def main(args):
                 prompts = [f"{id_prompt} {frame}" for frame in frame_prompt_list]
                 batch_size = len(prompts)
                 
-                # 현재 배치 프롬프트 내에서 캐릭터를 나타내는 토큰이 몇 번째 토큰인지 위치 파악(마스크 위해)
+                # 배치마다 token_indices 갱신
                 tokenizer = getattr(pipeline, "tokenizer", None) or getattr(pipeline, "tokenizer_2", None)
                 if tokenizer is None:
                     raise AttributeError("Pipeline has no tokenizer attribute")
+                
                 token_indices, span_lens = create_token_indices_span(
                     prompts, batch_size, concept_token=subject_str, tokenizer=tokenizer
                 )
@@ -118,10 +774,14 @@ def main(args):
                         # 저장 경로 재확인 (args에서 받은 경로)
                         proc._attn_save_dir = Path(args.output_dir)
 
+                if DEBUG:
+                    _dbg_print(f"[DBG] new batch: superclass={superclass} index={index}")
+                    for b, pr in enumerate(prompts):
+                        _dbg_print(f"[DBG] prompt[{b}]: {pr}")
                 
                 start_time = time.time()
                 
-                # 이미지 생성
+                #  guidance_scale은 베이스(첫 스텝) 값 
                 result = pipeline(
                     prompts,
                     generator=generator,
@@ -138,6 +798,8 @@ def main(args):
                 
                 total_images += batch_size
                 total_generation_time += batch_elapsed
+                
+                
                 
                 for j, image in enumerate(result.images):
                     prompt = prompts[j]
@@ -160,13 +822,22 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--guidance_scale', type=float, default=5.0,
-                       help='Base guidance scale')
+                       help='Base guidance scale (step 0)')
     parser.add_argument('--guidance_schedule', type=str, default=None,
-                       help='ex: "8,5" for 2 steps, or "7,8,5" for 3 steps.')
+                       help='Guidance schedule as comma-separated values. '
+                            'Example: "8,5" for 2 steps, or "7,8,5" for 3 steps. '
+                            'If None, uses --guidance_scale for all steps.')
     parser.add_argument('--num_inference_steps', type=int, default=2)
-    parser.add_argument('--mask_dropout', type=float, default=0.0)
+    parser.add_argument('--mask_dropout', type=float, default=0.0,
+                       help='Mask dropout rate: fraction of subject positions to randomly deactivate')
     parser.add_argument('--temperature', type=float, default=0.0005,
-                       help='temperature for attention mask generation in aggregate()')
+                       help='Softmax temperature for attention mask generation in aggregate()')
+    
+    #  Attention map 시각화 옵션
+    parser.add_argument('--save_attn_maps', action='store_true',
+                       help='Save frame-wise shared attention maps to file')
+    parser.add_argument('--attn_save_dir', type=str, default='./attn_maps_debug_1222',
+                       help='Directory to save attention maps')
     
     parser.add_argument('--pretrained_model', type=str,
                        default='Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers')
